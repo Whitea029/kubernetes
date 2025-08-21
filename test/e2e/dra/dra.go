@@ -44,7 +44,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	applyv1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/component-base/metrics/testutil"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/features"
@@ -55,7 +54,6 @@ import (
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2edaemonset "k8s.io/kubernetes/test/e2e/framework/daemonset"
 	e2eevents "k8s.io/kubernetes/test/e2e/framework/events"
-	e2emetrics "k8s.io/kubernetes/test/e2e/framework/metrics"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	admissionapi "k8s.io/pod-security-admission/api"
 	"k8s.io/utils/ptr"
@@ -708,7 +706,7 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 	singleNodeTests := func(withKubelet bool) {
 		nodes := drautils.NewNodes(f, 1, 1)
 		maxAllocations := 1
-		numPods := 10
+		numPods := 5
 		driver := drautils.NewDriver(f, nodes, drautils.DriverResources(maxAllocations)) // All tests get their own driver instance.
 		driver.WithKubelet = withKubelet
 		b := drautils.NewBuilder(f, driver)
@@ -923,9 +921,14 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 			}).WithTimeout(f.Timeouts.PodDelete).Should(gomega.HaveField("Status.Allocation", (*resourceapi.AllocationResult)(nil)))
 		})
 
+		// https://github.com/kubernetes/kubernetes/issues/133488
+		// It conflicts with "must run pods with extended resource on dra nodes and device plugin nodes" test case,
+		// because device plugin does not clean up the extended resource "example.com/resource", and kubelet still
+		// keeps "example.com/resource" : 0 in node.status.Capacity.
+		// add WithFlaky to filter out the following test until we can clean up the leaked "example.com/resource" in node.status.
 		if withKubelet {
 			// Serial because the example device plugin can only be deployed with one instance at a time.
-			f.It("supports extended resources together with ResourceClaim", f.WithSerial(), func(ctx context.Context) {
+			f.It("supports extended resources together with ResourceClaim", f.WithSerial(), f.WithFlaky(), func(ctx context.Context) {
 				extendedResourceName := deployDevicePlugin(ctx, f, nodes.NodeNames[0:1])
 
 				pod := b.PodExternal()
@@ -1066,120 +1069,6 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 					}
 					used[nodeName] = pod
 				}
-			})
-		})
-
-		ginkgo.Context("with network-attached resources", func() {
-			driver := drautils.NewDriver(f, nodes, drautils.NetworkResources(10, false))
-			driver.WithKubelet = withKubelet
-			b := drautils.NewBuilder(f, driver)
-
-			// This test needs the entire test cluster for itself, therefore it is marked as serial.
-			// Running it in parallel happened to cause resource issues.
-			f.It("supports sharing a claim sequentially", f.WithSlow(), f.WithSerial(), func(ctx context.Context) {
-				var objects []klog.KMetadata
-				objects = append(objects, b.ExternalClaim())
-
-				// This test used to test usage of the claim by one pod
-				// at a time. After removing the "not sharable"
-				// feature and bumping up the maximum number of
-				// consumers this is now a stress test which runs
-				// the maximum number of pods per claim in parallel.
-				// This only works on clusters with >= 3 nodes.
-				numMaxPods := resourceapi.ResourceClaimReservedForMaxSize
-				ginkgo.By(fmt.Sprintf("Creating %d pods sharing the same claim", numMaxPods))
-				pods := make([]*v1.Pod, numMaxPods)
-				for i := 0; i < numMaxPods; i++ {
-					pod := b.PodExternal()
-					pods[i] = pod
-					objects = append(objects, pod)
-				}
-				b.Create(ctx, objects...)
-
-				timeout := f.Timeouts.PodStartSlow * time.Duration(numMaxPods)
-				ensureDuration := f.Timeouts.PodStart // Don't check for too long, even if it is less precise.
-				podIsPending := gomega.HaveField("Spec.NodeName", gomega.BeEmpty())
-				waitForPodScheduled := func(pod *v1.Pod) {
-					ginkgo.GinkgoHelper()
-					gomega.Eventually(ctx, framework.GetObject(f.ClientSet.CoreV1().Pods(pod.Namespace).Get, pod.Name, metav1.GetOptions{})).
-						WithTimeout(timeout).
-						WithPolling(10*time.Second).
-						ShouldNot(podIsPending, "Pod should get scheduled.")
-				}
-				ensurePodNotScheduled := func(pod *v1.Pod) {
-					ginkgo.GinkgoHelper()
-					gomega.Consistently(ctx, framework.GetObject(f.ClientSet.CoreV1().Pods(pod.Namespace).Get, pod.Name, metav1.GetOptions{})).
-						WithTimeout(ensureDuration).
-						WithPolling(10*time.Second).
-						Should(podIsPending, "Pod should remain pending.")
-				}
-
-				// We don't know the order. All that matters is that all of them get scheduled eventually.
-				ginkgo.By(fmt.Sprintf("Waiting for %d pods to be scheduled", numMaxPods))
-				f.Timeouts.PodStartSlow *= time.Duration(numMaxPods)
-				var wg sync.WaitGroup
-				wg.Add(numMaxPods)
-				for i := 0; i < numMaxPods; i++ {
-					pod := pods[i]
-					go func() {
-						defer ginkgo.GinkgoRecover()
-						defer wg.Done()
-						waitForPodScheduled(pod)
-					}()
-				}
-				wg.Wait()
-
-				numMorePods := 10
-				ginkgo.By(fmt.Sprintf("Creating %d additional pods for the same claim", numMorePods))
-				morePods := make([]*v1.Pod, numMorePods)
-				objects = nil
-				for i := 0; i < numMorePods; i++ {
-					pod := b.PodExternal()
-					morePods[i] = pod
-					objects = append(objects, pod)
-				}
-				b.Create(ctx, objects...)
-
-				// None of the additional pods can run because of the ReservedFor limit.
-				ginkgo.By(fmt.Sprintf("Check for %s that the additional pods don't get scheduled", ensureDuration))
-				wg.Add(numMorePods)
-				for i := 0; i < numMorePods; i++ {
-					pod := morePods[i]
-					go func() {
-						defer ginkgo.GinkgoRecover()
-						defer wg.Done()
-						ensurePodNotScheduled(pod)
-					}()
-				}
-				wg.Wait()
-
-				// We need to delete each scheduled pod, otherwise the new ones cannot use the claim.
-				ginkgo.By(fmt.Sprintf("Deleting the initial %d pods", numMaxPods))
-				wg.Add(numMaxPods)
-				for i := 0; i < numMaxPods; i++ {
-					pod := pods[i]
-					go func() {
-						defer ginkgo.GinkgoRecover()
-						defer wg.Done()
-						err := f.ClientSet.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-						framework.ExpectNoError(err, "delete pod")
-						framework.ExpectNoError(e2epod.WaitForPodNotFoundInNamespace(ctx, f.ClientSet, pod.Name, pod.Namespace, f.Timeouts.PodStartSlow))
-					}()
-				}
-				wg.Wait()
-
-				// Now those should also get scheduled - eventually...
-				ginkgo.By(fmt.Sprintf("Waiting for the additional %d pods to be scheduled", numMorePods))
-				wg.Add(numMorePods)
-				for i := 0; i < numMorePods; i++ {
-					pod := morePods[i]
-					go func() {
-						defer ginkgo.GinkgoRecover()
-						defer wg.Done()
-						waitForPodScheduled(pod)
-					}()
-				}
-				wg.Wait()
 			})
 		})
 	}
@@ -1831,6 +1720,87 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 		})
 	}
 
+	consumableCapacityTests := func() {
+		nodes := drautils.NewNodes(f, 1, 1)
+		// single device which allows multiple allocations and has 80Gi consumable memory.
+		driver := drautils.NewDriver(f, nodes, drautils.ToDriverResources(
+			[]resourceapi.CounterSet{},
+			[]resourceapi.Device{
+				{
+					Name:                     "consumable-device-1",
+					AllowMultipleAllocations: ptr.To(true),
+					Capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
+						"memory": {
+							Value: resource.MustParse("8Gi"),
+							RequestPolicy: &resourceapi.CapacityRequestPolicy{
+								Default: ptr.To(resource.MustParse("1Gi")),
+								ValidRange: &resourceapi.CapacityRequestPolicyRange{
+									Min: ptr.To(resource.MustParse("1Gi")),
+								},
+							},
+						},
+					},
+				},
+			}...,
+		))
+		b := drautils.NewBuilder(f, driver)
+
+		f.It("must allow multiple allocations and consume capacity", f.WithLabel("KubeletMinVersion:1.34"), func(ctx context.Context) {
+			// The first pod will use 4Gi of the device.
+			claim := b.ExternalClaim()
+			claim.Spec.Devices.Requests[0].Exactly.Capacity = &resourceapi.CapacityRequirements{
+				Requests: map[resourceapi.QualifiedName]resource.Quantity{
+					"memory": resource.MustParse("4Gi"),
+				},
+			}
+			pod := b.PodExternal()
+			pod.Spec.ResourceClaims[0].ResourceClaimName = &claim.Name
+			b.Create(ctx, claim, pod)
+			b.TestPod(ctx, f, pod)
+
+			// The second pod will be failed to request 8Gi capacity.
+			claim2 := b.ExternalClaim()
+			claim2.Spec.Devices.Requests[0].Exactly.Capacity = &resourceapi.CapacityRequirements{
+				Requests: map[resourceapi.QualifiedName]resource.Quantity{
+					"memory": resource.MustParse("8Gi"),
+				},
+			}
+			pod2 := b.PodExternal()
+			pod2.Spec.ResourceClaims[0].ResourceClaimName = &claim2.Name
+			b.Create(ctx, claim2, pod2)
+
+			// The third pod should be able to use the rest 4Gi of the device.
+			claim3 := b.ExternalClaim()
+			claim3.Spec.Devices.Requests[0].Exactly.Capacity = &resourceapi.CapacityRequirements{
+				Requests: map[resourceapi.QualifiedName]resource.Quantity{
+					"memory": resource.MustParse("4Gi"),
+				},
+			}
+			pod3 := b.PodExternal()
+			pod3.Spec.ResourceClaims[0].ResourceClaimName = &claim3.Name
+			b.Create(ctx, claim3, pod3)
+			b.TestPod(ctx, f, pod3)
+
+			gomega.Consistently(ctx, func(ctx context.Context) error {
+				testPod2, err := f.ClientSet.CoreV1().Pods(pod2.Namespace).Get(ctx, pod2.Name, metav1.GetOptions{})
+				if err != nil {
+					return fmt.Errorf("expected the test pod %s to exist: %w", pod2.Name, err)
+				}
+				if testPod2.Status.Phase != v1.PodPending {
+					return fmt.Errorf("pod %s: unexpected status %s, expected status: %s", pod2.Name, testPod2.Status.Phase, v1.PodPending)
+				}
+				return nil
+			}, 20*time.Second, 200*time.Millisecond).Should(gomega.Succeed())
+
+			// Delete the first and third pod
+			b.DeletePodAndWaitForNotFound(ctx, pod)
+			b.DeletePodAndWaitForNotFound(ctx, pod3)
+
+			// There should be available capacity for pod2 now.
+			b.TestPod(ctx, f, pod2)
+		})
+	}
+
 	// It is okay to use the same context multiple times (like "control plane"),
 	// as long as the test names the still remain unique overall.
 
@@ -1841,6 +1811,10 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 	framework.Context("kubelet", feature.DynamicResourceAllocation, "on multiple nodes", func() { multiNodeTests(true) })
 
 	framework.Context("kubelet", feature.DynamicResourceAllocation, f.WithFeatureGate(features.DRAPrioritizedList), prioritizedListTests)
+
+	framework.Context("kubelet", feature.DynamicResourceAllocation, f.WithFeatureGate(features.DRAConsumableCapacity), consumableCapacityTests)
+
+	framework.Context("kubelet", feature.DynamicResourceAllocation, f.WithFeatureGate(features.DRAConsumableCapacity), consumableCapacityTests)
 
 	framework.Context("kubelet", feature.DynamicResourceAllocation, "with v1beta1 API", v1beta1Tests)
 	framework.Context("kubelet", feature.DynamicResourceAllocation, "with v1beta2 API", v1beta2Tests)
@@ -1922,7 +1896,6 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 			createdTaint := b.Create(ctx, taint)
 			taint = createdTaint[0].(*resourcealphaapi.DeviceTaintRule)
 			gomega.Expect(*taint).Should(gomega.HaveField("Spec.Taint.TimeAdded.Time", gomega.BeTemporally("~", time.Now(), time.Minute /* allow for some clock drift and delays */)))
-
 			framework.ExpectNoError(e2epod.WaitForPodTerminatingInNamespaceTimeout(ctx, f.ClientSet, pod.Name, f.Namespace.Name, f.Timeouts.PodStart))
 			pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, pod.Name, metav1.GetOptions{})
 			framework.ExpectNoError(err, "get pod")
@@ -1933,6 +1906,177 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 				"Reason":  gomega.Equal("DeletionByDeviceTaintManager"),
 				"Message": gomega.Equal("Device Taint manager: deleting due to NoExecute taint"),
 			}))))
+		})
+	})
+
+	framework.Context(f.WithFeatureGate(features.DRAExtendedResource), func() {
+		nodes := drautils.NewNodes(f, 1, 1)
+		driver := drautils.NewDriver(f, nodes, drautils.NetworkResources(10, false))
+		b := drautils.NewBuilder(f, driver)
+		b.UseExtendedResourceName = true
+
+		ginkgo.It("must run a pod with extended resource with one container one resource", func(ctx context.Context) {
+			pod := b.Pod()
+			res := v1.ResourceList{}
+			res[v1.ResourceName(drautils.ExtendedResourceName(0))] = resource.MustParse("1")
+			pod.Spec.Containers[0].Resources.Requests = res
+			pod.Spec.Containers[0].Resources.Limits = res
+
+			b.Create(ctx, pod)
+			err := e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod)
+			framework.ExpectNoError(err, "start pod")
+			containerEnv := []string{
+				"container_0_request_0", "true",
+			}
+			drautils.TestContainerEnv(ctx, f, pod, pod.Spec.Containers[0].Name, false, containerEnv...)
+		})
+
+		ginkgo.It("must run a pod with extended resource with one container three resources", func(ctx context.Context) {
+			pod := b.Pod()
+			res := v1.ResourceList{}
+			for i := range 3 {
+				res[v1.ResourceName(drautils.ExtendedResourceName(i))] = resource.MustParse("1")
+			}
+			pod.Spec.Containers[0].Resources.Requests = res
+			pod.Spec.Containers[0].Resources.Limits = res
+
+			b.Create(ctx, pod)
+			err := e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod)
+			framework.ExpectNoError(err, "start pod")
+			containerEnv := []string{
+				"container_0_request_0", "true",
+				"container_0_request_1", "true",
+				"container_0_request_2", "true",
+			}
+			drautils.TestContainerEnv(ctx, f, pod, pod.Spec.Containers[0].Name, false, containerEnv...)
+		})
+		ginkgo.It("must run a pod with extended resource with three containers one resource each", func(ctx context.Context) {
+			pod := b.Pod()
+			pod.Spec.Containers = append(pod.Spec.Containers, *pod.Spec.Containers[0].DeepCopy())
+			pod.Spec.Containers = append(pod.Spec.Containers, *pod.Spec.Containers[0].DeepCopy())
+			pod.Spec.Containers[0].Name = "container0"
+			pod.Spec.Containers[1].Name = "container1"
+			pod.Spec.Containers[2].Name = "container2"
+
+			for i := range 3 {
+				res := v1.ResourceList{}
+				res[v1.ResourceName(drautils.ExtendedResourceName(i))] = resource.MustParse("1")
+				pod.Spec.Containers[i].Resources.Requests = res
+				pod.Spec.Containers[i].Resources.Limits = res
+			}
+
+			b.Create(ctx, pod)
+			err := e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod)
+			framework.ExpectNoError(err, "start pod")
+			for i := range 3 {
+				containerEnv := []string{
+					fmt.Sprintf("container_%d_request_0", i), "true",
+				}
+				drautils.TestContainerEnv(ctx, f, pod, pod.Spec.Containers[i].Name, false, containerEnv...)
+			}
+		})
+		ginkgo.It("must run a pod with extended resource with three containers multiple resources each", func(ctx context.Context) {
+			pod := b.Pod()
+			pod.Spec.Containers = append(pod.Spec.Containers, *pod.Spec.Containers[0].DeepCopy())
+			pod.Spec.Containers = append(pod.Spec.Containers, *pod.Spec.Containers[0].DeepCopy())
+			pod.Spec.Containers[0].Name = "container0"
+			pod.Spec.Containers[1].Name = "container1"
+			pod.Spec.Containers[2].Name = "container2"
+
+			res := v1.ResourceList{}
+			res[v1.ResourceName(drautils.ExtendedResourceName(0))] = resource.MustParse("1")
+			pod.Spec.Containers[0].Resources.Requests = res
+			pod.Spec.Containers[0].Resources.Limits = res
+			res = v1.ResourceList{}
+			res[v1.ResourceName(drautils.ExtendedResourceName(1))] = resource.MustParse("1")
+			res[v1.ResourceName(drautils.ExtendedResourceName(2))] = resource.MustParse("1")
+			pod.Spec.Containers[1].Resources.Requests = res
+			pod.Spec.Containers[1].Resources.Limits = res
+			res = v1.ResourceList{}
+			res[v1.ResourceName(drautils.ExtendedResourceName(3))] = resource.MustParse("1")
+			res[v1.ResourceName(drautils.ExtendedResourceName(4))] = resource.MustParse("1")
+			res[v1.ResourceName(drautils.ExtendedResourceName(5))] = resource.MustParse("1")
+			pod.Spec.Containers[2].Resources.Requests = res
+			pod.Spec.Containers[2].Resources.Limits = res
+
+			b.Create(ctx, pod)
+			err := e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod)
+			framework.ExpectNoError(err, "start pod")
+			containerEnv := []string{
+				"container_0_request_0", "true",
+			}
+			drautils.TestContainerEnv(ctx, f, pod, pod.Spec.Containers[0].Name, false, containerEnv...)
+			containerEnv = []string{
+				"container_1_request_0", "true",
+				"container_1_request_1", "true",
+			}
+			drautils.TestContainerEnv(ctx, f, pod, pod.Spec.Containers[1].Name, false, containerEnv...)
+			containerEnv = []string{
+				"container_2_request_0", "true",
+				"container_2_request_1", "true",
+				"container_2_request_2", "true",
+			}
+			drautils.TestContainerEnv(ctx, f, pod, pod.Spec.Containers[2].Name, false, containerEnv...)
+		})
+	})
+
+	framework.Context(f.WithFeatureGate(features.DRAExtendedResource), func() {
+		nodes := drautils.NewNodes(f, 2, 2)
+		nodes.NumReservedNodes = 1
+		driver := drautils.NewDriver(f, nodes, drautils.NetworkResources(2, false))
+		b := drautils.NewBuilder(f, driver)
+		b.UseExtendedResourceName = true
+
+		// This test needs the entire test cluster for itself, one node in the cluster
+		// is deployed device plugin for the test, therefore it is marked as serial.
+		// The test runs two pods, one pod request extended resource backed by DRA,
+		// the other pod requests extended resource by device plugin.
+		f.It("must run pods with extended resource on dra nodes and device plugin nodes", f.WithSerial(), func(ctx context.Context) {
+			extendedResourceName := deployDevicePlugin(ctx, f, nodes.ExtraNodeNames)
+			// drautils.ExtendedResourceName(-1) must be the same as the returned extendedResourceName
+			// drautils.ExtendedResourceName(-1) is used for DRA drivers
+			// extendedResourceName is used for device plugin.
+			gomega.Expect(string(extendedResourceName)).To(gomega.Equal(drautils.ExtendedResourceName(-1)))
+
+			pod1 := b.Pod()
+			res := v1.ResourceList{}
+			res[v1.ResourceName(drautils.ExtendedResourceName(-1))] = resource.MustParse("2")
+			pod1.Spec.Containers[0].Resources.Requests = res
+			pod1.Spec.Containers[0].Resources.Limits = res
+			b.Create(ctx, pod1)
+
+			pod2 := b.Pod()
+			pod2.Spec.Containers[0].Resources.Requests = res
+			pod2.Spec.Containers[0].Resources.Limits = res
+			b.Create(ctx, pod2)
+
+			err := e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod1)
+			framework.ExpectNoError(err, "start pod1")
+			err = e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod2)
+			framework.ExpectNoError(err, "start pod2")
+
+			scheduledPod1, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, pod1.Name, metav1.GetOptions{})
+			gomega.Expect(scheduledPod1).ToNot(gomega.BeNil())
+			framework.ExpectNoError(err)
+
+			scheduledPod2, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, pod2.Name, metav1.GetOptions{})
+			gomega.Expect(scheduledPod2).ToNot(gomega.BeNil())
+			framework.ExpectNoError(err)
+
+			draPod := scheduledPod1
+			devicePluginPod := scheduledPod2
+			if scheduledPod1.Spec.NodeName == nodes.ExtraNodeNames[0] {
+				draPod = scheduledPod2
+				devicePluginPod = scheduledPod1
+			}
+
+			gomega.Expect(devicePluginPod.Spec.NodeName).To(gomega.Equal(nodes.ExtraNodeNames[0]))
+			gomega.Expect(devicePluginPod.Status.ExtendedResourceClaimStatus).To(gomega.BeNil())
+			gomega.Expect(draPod.Spec.NodeName).To(gomega.Equal(nodes.NodeNames[0]))
+			containerEnv := []string{
+				"container_0_request_0", "true",
+			}
+			drautils.TestContainerEnv(ctx, f, draPod, draPod.Spec.Containers[0].Name, false, containerEnv...)
 		})
 	})
 
@@ -2028,6 +2172,14 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 			emptySlice := gomega.HaveField("Spec.Devices", gomega.BeEmpty())
 			gomega.Eventually(ctx, listSlices).WithTimeout(2 * time.Minute).Should(gomega.HaveField("Items", gomega.HaveExactElements(emptySlice)))
 			expectStats = resourceslice.Stats{NumCreates: int64(numSlices) + 1, NumDeletes: int64(numSlices)}
+
+			// There is a window of time where the ResourceSlice exists and is
+			// returned in a list but before that ResourceSlice is accounted for
+			// in the controller's stats, consisting mostly of network latency
+			// between this test process and the API server. Wait for the stats
+			// to converge before asserting there are no further changes.
+			gomega.Eventually(ctx, controller.GetStats).WithTimeout(30 * time.Second).Should(gomega.Equal(expectStats))
+
 			gomega.Consistently(ctx, controller.GetStats).WithTimeout(2 * mutationCacheTTL).Should(gomega.Equal(expectStats))
 		})
 	})
@@ -2160,12 +2312,18 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 			framework.ExpectNoError(err)
 			gomega.Expect(scheduledPod).ToNot(gomega.BeNil())
 
+			var shareIDStr *string
+			if shareID := allocatedResourceClaim.Status.Allocation.Devices.Results[0].ShareID; shareID != nil {
+				shareIDStr = ptr.To(string(*shareID))
+			}
+
 			ginkgo.By("Setting the device status a first time")
 			allocatedResourceClaim.Status.Devices = append(allocatedResourceClaim.Status.Devices,
 				resourceapi.AllocatedDeviceStatus{
 					Driver:     allocatedResourceClaim.Status.Allocation.Devices.Results[0].Driver,
 					Pool:       allocatedResourceClaim.Status.Allocation.Devices.Results[0].Pool,
 					Device:     allocatedResourceClaim.Status.Allocation.Devices.Results[0].Device,
+					ShareID:    shareIDStr,
 					Conditions: []metav1.Condition{{Type: "a", Status: "True", Message: "c", Reason: "d", LastTransitionTime: metav1.NewTime(time.Now().Truncate(time.Second))}},
 					Data:       &runtime.RawExtension{Raw: []byte(`{"foo":"bar"}`)},
 					NetworkData: &resourceapi.NetworkDeviceData{
@@ -2190,6 +2348,7 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 				Driver:     allocatedResourceClaim.Status.Allocation.Devices.Results[0].Driver,
 				Pool:       allocatedResourceClaim.Status.Allocation.Devices.Results[0].Pool,
 				Device:     allocatedResourceClaim.Status.Allocation.Devices.Results[0].Device,
+				ShareID:    shareIDStr,
 				Conditions: []metav1.Condition{{Type: "e", Status: "True", Message: "g", Reason: "h", LastTransitionTime: metav1.NewTime(time.Now().Truncate(time.Second))}},
 				Data:       &runtime.RawExtension{Raw: []byte(`{"bar":"foo"}`)},
 				NetworkData: &resourceapi.NetworkDeviceData{
@@ -2358,276 +2517,6 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 			mustFailToDelete(fictionalNodeClient, "fictional plugin", createdClusterSlice, matchVAPDeniedError(fictionalNodeName, createdClusterSlice))
 			mustDelete(f.ClientSet, "admin", createdClusterSlice)
 		})
-
-		f.It("controller manager metrics track ResourceClaim operations with correct labels", f.WithSerial(), f.WithFeatureGate(features.DRAAdminAccess), func(ctx context.Context) {
-			b := drautils.NewBuilderNow(ctx, f, driver)
-
-			ginkgo.By("Getting initial controller manager metrics")
-			grabber, err := e2emetrics.NewMetricsGrabber(ctx, f.ClientSet, nil, f.ClientConfig(), false, false, true, false, false, false)
-			framework.ExpectNoError(err, "create metrics grabber")
-
-			initialMetrics, err := grabber.GrabFromControllerManager(ctx)
-			framework.ExpectNoError(err, "grab initial controller manager metrics")
-
-			// Extract initial metric values
-			initialCreateCount := getMetricValue(initialMetrics, "resourceclaim_controller_creates_total", map[string]string{"status": "success", "admin_access": "false"})
-			initialCreateCountAdmin := getMetricValue(initialMetrics, "resourceclaim_controller_creates_total", map[string]string{"status": "success", "admin_access": "true"})
-			initialClaimGaugeUnallocated := getMetricValue(initialMetrics, "resourceclaim_controller_resource_claims", map[string]string{"admin_access": "false", "allocated": "false"})
-			initialClaimGaugeAllocated := getMetricValue(initialMetrics, "resourceclaim_controller_resource_claims", map[string]string{"admin_access": "false", "allocated": "true"})
-			initialClaimGaugeAdminUnallocated := getMetricValue(initialMetrics, "resourceclaim_controller_resource_claims", map[string]string{"admin_access": "true", "allocated": "false"})
-			initialClaimGaugeAdminAllocated := getMetricValue(initialMetrics, "resourceclaim_controller_resource_claims", map[string]string{"admin_access": "true", "allocated": "true"})
-
-			ginkgo.By("Creating a ResourceClaimTemplate and Pod to trigger controller processing")
-			// Create a ResourceClaimTemplate without admin access
-			template := &resourceapi.ResourceClaimTemplate{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: "metrics-test-template-",
-					Namespace:    f.Namespace.Name,
-				},
-				Spec: resourceapi.ResourceClaimTemplateSpec{
-					Spec: resourceapi.ResourceClaimSpec{
-						Devices: resourceapi.DeviceClaim{
-							Requests: []resourceapi.DeviceRequest{{
-								Name: "req-0",
-								Exactly: &resourceapi.ExactDeviceRequest{
-									DeviceClassName: b.ClassName(),
-									// AdminAccess defaults to false when not specified
-								},
-							}},
-						},
-					},
-				},
-			}
-			createdTemplate, err := f.ClientSet.ResourceV1().ResourceClaimTemplates(f.Namespace.Name).Create(ctx, template, metav1.CreateOptions{})
-			framework.ExpectNoError(err, "create ResourceClaimTemplate without admin access")
-
-			pod := &v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: "metrics-test-pod-",
-					Namespace:    f.Namespace.Name,
-				},
-				Spec: v1.PodSpec{
-					RestartPolicy: v1.RestartPolicyNever,
-					Containers: []v1.Container{{
-						Name:  "test-container",
-						Image: "busybox:1.35",
-						Command: []string{
-							"sh", "-c", "echo 'Metrics test pod' && exit 0",
-						},
-						Resources: v1.ResourceRequirements{
-							Claims: []v1.ResourceClaim{{
-								Name: "my-claim",
-							}},
-						},
-					}},
-					ResourceClaims: []v1.PodResourceClaim{{
-						Name:                      "my-claim",
-						ResourceClaimTemplateName: &createdTemplate.Name,
-					}},
-				},
-			}
-			createdPod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
-			framework.ExpectNoError(err, "create Pod with ResourceClaimTemplate")
-
-			ginkgo.By("Waiting for controller to create ResourceClaim from template")
-			var generatedClaimName string
-			gomega.Eventually(ctx, func(ctx context.Context) error {
-				updatedPod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, createdPod.Name, metav1.GetOptions{})
-				if err != nil {
-					return fmt.Errorf("get pod: %w", err)
-				}
-
-				for _, rc := range updatedPod.Spec.ResourceClaims {
-					if rc.Name == "my-claim" && rc.ResourceClaimName != nil {
-						generatedClaimName = *rc.ResourceClaimName
-						return nil
-					}
-				}
-
-				// Check if any ResourceClaims exist in the namespace that are owned by this pod
-				claims, err := f.ClientSet.ResourceV1beta2().ResourceClaims(f.Namespace.Name).List(ctx, metav1.ListOptions{})
-				if err == nil {
-					for _, claim := range claims.Items {
-						// Check if this ResourceClaim is owned by our pod
-						for _, ownerRef := range claim.OwnerReferences {
-							if ownerRef.Kind == "Pod" && ownerRef.Name == updatedPod.Name {
-								generatedClaimName = claim.Name
-								return nil
-							}
-						}
-					}
-				}
-
-				return fmt.Errorf("ResourceClaim not yet generated from template")
-			}).WithTimeout(30 * time.Second).WithPolling(1 * time.Second).Should(gomega.Succeed())
-
-			ginkgo.By("Verifying metrics reflect the controller-created claim without admin access")
-			gomega.Eventually(ctx, func(ctx context.Context) error {
-				currentMetrics, err := grabber.GrabFromControllerManager(ctx)
-				if err != nil {
-					return fmt.Errorf("grab current controller manager metrics: %w", err)
-				}
-
-				// Check that creates_total metric incremented for admin_access="false"
-				currentCreateCount := getMetricValue(currentMetrics, "resourceclaim_controller_creates_total", map[string]string{"status": "success", "admin_access": "false"})
-				if currentCreateCount != initialCreateCount+1 {
-					return fmt.Errorf("expected resourceclaim_controller_creates_total{status=\"success\",admin_access=\"false\"} to be %v, got %v", initialCreateCount+1, currentCreateCount)
-				}
-
-				// Check that resource_claims gauge incremented for the claim without admin access
-				// Note: The claim might be allocated or unallocated depending on timing
-				currentClaimGaugeUnallocated := getMetricValue(currentMetrics, "resourceclaim_controller_resource_claims", map[string]string{"admin_access": "false", "allocated": "false"})
-				currentClaimGaugeAllocated := getMetricValue(currentMetrics, "resourceclaim_controller_resource_claims", map[string]string{"admin_access": "false", "allocated": "true"})
-				totalClaims := currentClaimGaugeUnallocated + currentClaimGaugeAllocated
-				expectedTotal := initialClaimGaugeUnallocated + initialClaimGaugeAllocated + 1
-
-				if totalClaims != expectedTotal {
-					return fmt.Errorf("expected total resourceclaim_controller_resource_claims{admin_access=\"false\"} to be %v, got %v", expectedTotal, totalClaims)
-				}
-
-				return nil
-			}).WithTimeout(30 * time.Second).WithPolling(2 * time.Second).Should(gomega.Succeed())
-
-			ginkgo.By("Cleaning up test resources")
-			err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, createdPod.Name, metav1.DeleteOptions{})
-			framework.ExpectNoError(err, "delete test Pod")
-			if generatedClaimName != "" {
-				err = f.ClientSet.ResourceV1beta2().ResourceClaims(f.Namespace.Name).Delete(ctx, generatedClaimName, metav1.DeleteOptions{})
-				if err != nil && !apierrors.IsNotFound(err) {
-					framework.ExpectNoError(err, "delete generated ResourceClaim")
-				}
-			}
-			err = f.ClientSet.ResourceV1beta2().ResourceClaimTemplates(f.Namespace.Name).Delete(ctx, createdTemplate.Name, metav1.DeleteOptions{})
-			framework.ExpectNoError(err, "delete test ResourceClaimTemplate")
-
-			ginkgo.By("Setting up namespace for admin access and creating admin ResourceClaimTemplate")
-			// Label the namespace to allow admin access
-			_, err = f.ClientSet.CoreV1().Namespaces().Apply(ctx,
-				applyv1.Namespace(f.Namespace.Name).WithLabels(map[string]string{"resource.kubernetes.io/admin-access": "true"}),
-				metav1.ApplyOptions{FieldManager: f.UniqueName})
-			framework.ExpectNoError(err, "label namespace for admin access")
-
-			// Create a ResourceClaimTemplate with admin access
-			adminTemplate := &resourceapi.ResourceClaimTemplate{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: "admin-metrics-test-template-",
-					Namespace:    f.Namespace.Name,
-				},
-				Spec: resourceapi.ResourceClaimTemplateSpec{
-					Spec: resourceapi.ResourceClaimSpec{
-						Devices: resourceapi.DeviceClaim{
-							Requests: []resourceapi.DeviceRequest{{
-								Name: "req-0",
-								Exactly: &resourceapi.ExactDeviceRequest{
-									DeviceClassName: b.ClassName(),
-									AdminAccess:     ptr.To(true),
-								},
-							}},
-						},
-					},
-				},
-			}
-			createdAdminTemplate, err := f.ClientSet.ResourceV1().ResourceClaimTemplates(f.Namespace.Name).Create(ctx, adminTemplate, metav1.CreateOptions{})
-			framework.ExpectNoError(err, "create ResourceClaimTemplate with admin access")
-
-			adminPod := &v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: "admin-metrics-test-pod-",
-					Namespace:    f.Namespace.Name,
-				},
-				Spec: v1.PodSpec{
-					RestartPolicy: v1.RestartPolicyNever,
-					Containers: []v1.Container{{
-						Name:  "test-container",
-						Image: "busybox:1.35",
-						Command: []string{
-							"sh", "-c", "echo 'Admin metrics test pod' && exit 0",
-						},
-						Resources: v1.ResourceRequirements{
-							Claims: []v1.ResourceClaim{{
-								Name: "my-admin-claim",
-							}},
-						},
-					}},
-					ResourceClaims: []v1.PodResourceClaim{{
-						Name:                      "my-admin-claim",
-						ResourceClaimTemplateName: &createdAdminTemplate.Name,
-					}},
-				},
-			}
-			createdAdminPod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, adminPod, metav1.CreateOptions{})
-			framework.ExpectNoError(err, "create Pod with admin ResourceClaimTemplate")
-
-			ginkgo.By("Waiting for controller to create admin ResourceClaim from template")
-			var generatedAdminClaimName string
-			gomega.Eventually(ctx, func(ctx context.Context) error {
-				updatedPod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, createdAdminPod.Name, metav1.GetOptions{})
-				if err != nil {
-					return fmt.Errorf("get admin pod: %w", err)
-				}
-
-				for _, rc := range updatedPod.Spec.ResourceClaims {
-					if rc.Name == "my-admin-claim" && rc.ResourceClaimName != nil {
-						generatedAdminClaimName = *rc.ResourceClaimName
-						return nil
-					}
-				}
-
-				// Check if any ResourceClaims exist in the namespace that are owned by this admin pod
-				claims, err := f.ClientSet.ResourceV1beta2().ResourceClaims(f.Namespace.Name).List(ctx, metav1.ListOptions{})
-				if err == nil {
-					for _, claim := range claims.Items {
-						// Check if this ResourceClaim is owned by our admin pod
-						for _, ownerRef := range claim.OwnerReferences {
-							if ownerRef.Kind == "Pod" && ownerRef.Name == updatedPod.Name {
-								generatedAdminClaimName = claim.Name
-								return nil
-							}
-						}
-					}
-				}
-
-				return fmt.Errorf("admin ResourceClaim not yet generated from template")
-			}).WithTimeout(30 * time.Second).WithPolling(1 * time.Second).Should(gomega.Succeed())
-
-			ginkgo.By("Verifying metrics reflect the controller-created claim with admin access")
-			gomega.Eventually(ctx, func(ctx context.Context) error {
-				currentMetrics, err := grabber.GrabFromControllerManager(ctx)
-				if err != nil {
-					return fmt.Errorf("grab current controller manager metrics: %w", err)
-				}
-
-				// Check that creates_total metric incremented for admin_access="true"
-				currentCreateCountAdmin := getMetricValue(currentMetrics, "resourceclaim_controller_creates_total", map[string]string{"status": "success", "admin_access": "true"})
-				if currentCreateCountAdmin != initialCreateCountAdmin+1 {
-					return fmt.Errorf("expected resourceclaim_controller_creates_total{status=\"success\",admin_access=\"true\"} to be %v, got %v", initialCreateCountAdmin+1, currentCreateCountAdmin)
-				}
-
-				// Check that resource_claims gauge incremented for admin claim
-				currentClaimGaugeAdminUnallocated := getMetricValue(currentMetrics, "resourceclaim_controller_resource_claims", map[string]string{"admin_access": "true", "allocated": "false"})
-				currentClaimGaugeAdminAllocated := getMetricValue(currentMetrics, "resourceclaim_controller_resource_claims", map[string]string{"admin_access": "true", "allocated": "true"})
-				totalAdminClaims := currentClaimGaugeAdminUnallocated + currentClaimGaugeAdminAllocated
-				expectedAdminTotal := initialClaimGaugeAdminUnallocated + initialClaimGaugeAdminAllocated + 1
-
-				if totalAdminClaims != expectedAdminTotal {
-					return fmt.Errorf("expected total resourceclaim_controller_resource_claims{admin_access=\"true\"} to be %v, got %v", expectedAdminTotal, totalAdminClaims)
-				}
-
-				return nil
-			}).WithTimeout(30 * time.Second).WithPolling(2 * time.Second).Should(gomega.Succeed())
-
-			ginkgo.By("Cleaning up admin test resources")
-			err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, createdAdminPod.Name, metav1.DeleteOptions{})
-			framework.ExpectNoError(err, "delete admin test Pod")
-			if generatedAdminClaimName != "" {
-				err = f.ClientSet.ResourceV1beta2().ResourceClaims(f.Namespace.Name).Delete(ctx, generatedAdminClaimName, metav1.DeleteOptions{})
-				if err != nil && !apierrors.IsNotFound(err) {
-					framework.ExpectNoError(err, "delete generated admin ResourceClaim")
-				}
-			}
-			err = f.ClientSet.ResourceV1beta2().ResourceClaimTemplates(f.Namespace.Name).Delete(ctx, createdAdminTemplate.Name, metav1.DeleteOptions{})
-			framework.ExpectNoError(err, "delete admin test ResourceClaimTemplate")
-		})
 	})
 
 	multipleDrivers := func(nodeV1beta1, nodeV1 bool) {
@@ -2684,26 +2573,3 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 		multipleDriversContext("using drapbv1beta1 and drapbv1", true, true)
 	})
 })
-
-// getMetricValue extracts the value of a metric with specific labels.
-// Returns 0 if the metric is not found or doesn't have the specified labels.
-func getMetricValue(metrics e2emetrics.ControllerManagerMetrics, metricName string, labels map[string]string) float64 {
-	samples, exists := testutil.Metrics(metrics)[metricName]
-	if !exists {
-		return 0
-	}
-
-	for _, sample := range samples {
-		match := true
-		for labelKey, labelValue := range labels {
-			if string(sample.Metric[testutil.LabelName(labelKey)]) != labelValue {
-				match = false
-				break
-			}
-		}
-		if match {
-			return float64(sample.Value)
-		}
-	}
-	return 0
-}

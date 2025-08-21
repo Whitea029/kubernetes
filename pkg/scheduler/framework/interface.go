@@ -440,12 +440,12 @@ type ReservePlugin interface {
 // These plugins are called before a pod being scheduled.
 type PreBindPlugin interface {
 	Plugin
-	// PreBindPreFlight is called before PreBind, and the plugin is supposed to return Success, Skip, or Error status.
+	// PreBindPreFlight is called before PreBind, and the plugin is supposed to return Success, Skip, or Error status
+	// to tell the scheduler whether the plugin will do something in PreBind or not.
 	// If it returns Success, it means this PreBind plugin will handle this pod.
 	// If it returns Skip, it means this PreBind plugin has nothing to do with the pod, and PreBind will be skipped.
 	// This function should be lightweight, and shouldn't do any actual operation, e.g., creating a volume etc.
 	PreBindPreFlight(ctx context.Context, state fwk.CycleState, p *v1.Pod, nodeName string) *fwk.Status
-
 	// PreBind is called before binding a pod. All prebind plugins must return
 	// success or the pod will be rejected and won't be sent for binding.
 	PreBind(ctx context.Context, state fwk.CycleState, p *v1.Pod, nodeName string) *fwk.Status
@@ -526,6 +526,10 @@ type Framework interface {
 	// internal error. In either case the pod is not going to be bound.
 	RunPreBindPlugins(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeName string) *fwk.Status
 
+	// RunPreBindPreFlights runs the set of configured PreBindPreFlight functions from PreBind plugins.
+	// It returns immediately if any of the plugins returns a non-skip status.
+	RunPreBindPreFlights(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeName string) *fwk.Status
+
 	// RunPostBindPlugins runs the set of configured PostBind plugins.
 	RunPostBindPlugins(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeName string)
 
@@ -546,6 +550,9 @@ type Framework interface {
 	// to a map of currently waiting pods and return status with "Wait" code.
 	// Pod will remain waiting pod for the minimum duration returned by the Permit plugins.
 	RunPermitPlugins(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeName string) *fwk.Status
+
+	// WillWaitOnPermit returns whether this pod will wait on permit by checking if the pod is a waiting pod.
+	WillWaitOnPermit(ctx context.Context, pod *v1.Pod) bool
 
 	// WaitOnPermit will block, if the pod is a waiting pod, until the waiting pod is rejected or allowed.
 	WaitOnPermit(ctx context.Context, pod *v1.Pod) *fwk.Status
@@ -579,6 +586,8 @@ type Framework interface {
 	SetPodNominator(nominator PodNominator)
 	// SetPodActivator sets the PodActivator
 	SetPodActivator(activator PodActivator)
+	// SetAPICacher sets the APICacher
+	SetAPICacher(apiCacher APICacher)
 
 	// Close calls Close method of each plugin.
 	Close() error
@@ -642,6 +651,49 @@ type Handle interface {
 
 	// Parallelizer returns a parallelizer holding parallelism for scheduler.
 	Parallelizer() parallelize.Parallelizer
+
+	// APIDispatcher returns a fwk.APIDispatcher that can be used to dispatch API calls directly.
+	// This is non-nil if the SchedulerAsyncAPICalls feature gate is enabled.
+	APIDispatcher() fwk.APIDispatcher
+
+	// APICacher returns an APICacher that coordinates API calls with the scheduler's internal cache.
+	// Use this to ensure the scheduler's view of the cluster remains consistent.
+	// This is non-nil if the SchedulerAsyncAPICalls feature gate is enabled.
+	APICacher() APICacher
+}
+
+// APICacher defines methods that send API calls through the scheduler's cache
+// before they are executed asynchronously by the APIDispatcher.
+// This ensures the scheduler's internal state is updated optimistically,
+// reflecting the intended outcome of the call.
+// This methods should be used only if the SchedulerAsyncAPICalls feature gate is enabled.
+type APICacher interface {
+	// PatchPodStatus sends a patch request for a Pod's status.
+	// The patch could be first applied to the cached Pod object and then the API call is executed asynchronously.
+	// It returns a channel that can be used to wait for the call's completion.
+	PatchPodStatus(pod *v1.Pod, condition *v1.PodCondition, nominatingInfo *NominatingInfo) (<-chan error, error)
+
+	// BindPod sends a binding request. The binding could be first applied to the cached Pod object
+	// and then the API call is executed asynchronously.
+	// It returns a channel that can be used to wait for the call's completion.
+	BindPod(binding *v1.Binding) (<-chan error, error)
+
+	// WaitOnFinish blocks until the result of an API call is sent to the given onFinish channel
+	// (returned by methods BindPod or PreemptPod).
+	//
+	// It returns the error received from the channel.
+	// It also returns nil if the call was skipped or overwritten,
+	// as these are considered successful lifecycle outcomes.
+	// Direct onFinish channel read can be used to access these results.
+	WaitOnFinish(ctx context.Context, onFinish <-chan error) error
+}
+
+// APICallImplementations define constructors for each fwk.APICall that is used by the scheduler internally.
+type APICallImplementations[T, K fwk.APICall] struct {
+	// PodStatusPatch is a constructor used to create fwk.APICall object for pod status patch.
+	PodStatusPatch func(pod *v1.Pod, condition *v1.PodCondition, nominatingInfo *NominatingInfo) T
+	// PodBinding is a constructor used to create fwk.APICall object for pod binding.
+	PodBinding func(binding *v1.Binding) K
 }
 
 // PreFilterResult wraps needed info for scheduler framework to act upon PreFilter phase.

@@ -589,16 +589,6 @@ func containerChanged(container *v1.Container, containerStatus *kubecontainer.St
 }
 
 func shouldRestartOnFailure(pod *v1.Pod) bool {
-	// With feature ContainerRestartRules enabled, the pod should be restarted
-	// on failure if any of its containers have container-level restart policy
-	// that is restartable.
-	if utilfeature.DefaultFeatureGate.Enabled(features.ContainerRestartRules) {
-		for _, c := range pod.Spec.Containers {
-			if podutil.IsContainerRestartable(pod.Spec, c) {
-				return true
-			}
-		}
-	}
 	return pod.Spec.RestartPolicy != v1.RestartPolicyNever
 }
 
@@ -1147,7 +1137,11 @@ func (m *kubeGenericRuntimeManager) computePodActions(ctx context.Context, pod *
 		var reason containerKillReason
 		restart := shouldRestartOnFailure(pod)
 		if utilfeature.DefaultFeatureGate.Enabled(features.ContainerRestartRules) {
-			restart = kubecontainer.ShouldContainerBeRestarted(&container, pod, podStatus)
+			// For probe failures, use container-level restart policy only. Container-level restart
+			// rules are not evaluated because the container is still running.
+			if container.RestartPolicy != nil {
+				restart = *container.RestartPolicy != v1.ContainerRestartPolicyNever
+			}
 		}
 		if _, _, changed := containerChanged(&container, containerStatus); changed {
 			message = fmt.Sprintf("Container %s definition changed", container.Name)
@@ -1285,6 +1279,25 @@ func (m *kubeGenericRuntimeManager) SyncPod(ctx context.Context, pod *v1.Pod, po
 
 		logger.V(4).Info("Creating PodSandbox for pod", "pod", klog.KObj(pod))
 		metrics.StartedPodsTotal.Inc()
+		if utilfeature.DefaultFeatureGate.Enabled(features.UserNamespacesSupport) && pod.Spec.HostUsers != nil && !*pod.Spec.HostUsers {
+			metrics.StartedUserNamespacedPodsTotal.Inc()
+			// Failures in user namespace creation could happen at any point in the pod lifecycle,
+			// but usually will be caught in container creation.
+			// To avoid specifically handling each error case, loop through the result after the sync finishes
+			defer func() {
+				// catch unhandled errors
+				for _, res := range result.SyncResults {
+					if res.Error != nil {
+						metrics.StartedUserNamespacedPodsErrorsTotal.Inc()
+						return
+					}
+				}
+				// catch handled error
+				if result.SyncError != nil {
+					metrics.StartedUserNamespacedPodsErrorsTotal.Inc()
+				}
+			}()
+		}
 		createSandboxResult := kubecontainer.NewSyncResult(kubecontainer.CreatePodSandbox, format.Pod(pod))
 		result.AddSyncResult(createSandboxResult)
 
